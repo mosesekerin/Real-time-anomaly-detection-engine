@@ -1,0 +1,20 @@
+log:
+  path: /var/log/nginx/hng-access.log
+  dead_letter_path: /var/log/nginx/hng-access.dead.log
+  poll_interval_seconds: 0.5
+
+monitor:
+  metrics_interval_seconds: 60
+
+detection:
+  window_seconds: 60
+  request_rate_threshold: 200
+  error_rate_threshold: 0.4
+  z_score_threshold: 3.0
+
+blocker:
+  ban_ttl_seconds: 300
+
+notifier:
+  enabled: false
+  webhook_url: ""

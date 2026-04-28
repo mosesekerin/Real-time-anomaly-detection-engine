@@ -1,0 +1,5 @@
+# No third-party dependencies yet — stdlib only.
+# Add here as components are built:
+# redis>=5.0
+# pyyaml>=6.0
+pytest>=8.0
