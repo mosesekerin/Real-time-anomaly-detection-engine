@@ -4,6 +4,7 @@ services:
     volumes:
       - HNG-nginx-logs:/var/log/nginx
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro          # ADD: mounts our proxy config
     command: >
       /bin/sh -c "
         rm -f /var/log/nginx/access.log /var/log/nginx/error.log &&
@@ -11,11 +12,23 @@ services:
       "
     ports:
       - "80:80"
+    networks:
+      - internal                                       # ADD
+    depends_on:
+      - nextcloud                                      # ADD
+
+  nextcloud:                                           # ADD: entire service
+    image: kefaslungu/hng-nextcloud
+    expose:
+      - "80"                                           # internal only, not published
+    networks:
+      - internal
+    restart: unless-stopped
 
   log-monitor:
     build: .
     volumes:
-      - HNG-nginx-logs:/var/log/nginx:ro   # read-only mount
+      - HNG-nginx-logs:/var/log/nginx:ro
     environment:
       NGINX_LOG_PATH: /var/log/nginx/hng-access.log
       DEAD_LETTER_PATH: /var/log/nginx/hng-access.dead.log
@@ -25,5 +38,9 @@ services:
 
 volumes:
   HNG-nginx-logs:
-    external: true   # the existing volume from your Nginx setup
+    external: true
     name: HNG-nginx-logs
+
+networks:
+  internal:                                            # ADD
+    driver: bridge
