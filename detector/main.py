@@ -1,31 +1,5 @@
 """
-detector/main.py — Multi-threaded anomaly detection daemon.
-
-Architecture:
-  - Thread 1: LogTailer → reads Nginx logs
-  - Thread 2: Parser → validates JSON, emits LogEntry
-  - Thread 3: Detector → runs anomaly scoring, blocking, escalation
-  - Thread 4: BackgroundTasks → recalculate baselines, process unbans, health check
-  - Thread 5: Dashboard → Flask HTTP server (read-only metrics)
-
-Communication:
-  - ParseQueue: LogTailer → Parser (raw lines)
-  - DetectQueue: Parser → Detector (validated entries)
-  - Shared JSON files: BlocklistManager, UnbannerManager, MetricsWriter
-  - Logging: all threads write to stdout/file
-
-Concurrency model:
-  - Thread-safe queues (Queue.Queue from stdlib)
-  - File-level locks for JSON access
-  - No shared mutable state between threads (safe by design)
-  - Graceful shutdown via Event flag
-
-Stability features:
-  - Circuit breaker for Slack (don't retry forever)
-  - Memory leak detection (periodic GC + RSS monitoring)
-  - Error recovery (catch exceptions, log, continue)
-  - Health check (detect hung threads, log metrics)
-  - Uptime tracking (report every hour)
+detector/main.py — Production daemon using actual FileTailer API (FIXED).
 """
 
 import os
@@ -37,13 +11,9 @@ import queue
 import signal
 import traceback
 import psutil
-from datetime import datetime, timezone
-from typing import Optional
-from pathlib import Path
 
-# Import detector modules
 from detector.tailer import FileTailer
-from detector.parser import parse_line, LogEntry
+from detector.parser import parse_line
 from detector.sliding_window import SlidingWindow
 from detector.baseline import BaselineEngine
 from detector.detector import AnomalyDetector, Decision
@@ -53,107 +23,63 @@ from detector.slack_alerter import get_slack_alerter
 from detector.metrics_writer import MetricsWriter
 from detector.dashboard import run_dashboard
 
-
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
-
-# Paths
-NGINX_LOG_PATH = os.environ.get("NGINX_LOG_PATH", "/var/log/nginx/hng-access.log")
-DEAD_LETTER_PATH = os.environ.get("DEAD_LETTER_PATH", "/var/log/nginx/hng-access.dead.log")
-
-# Queue sizes
+NGINX_LOG_PATH = os.environ.get("NGINX_LOG_PATH", "logs/test-access.log")
 PARSE_QUEUE_SIZE = 1000
 DETECT_QUEUE_SIZE = 1000
-
-# Logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-LOG_FILE = os.environ.get("LOG_FILE", "/tmp/hng_detector.log")
-
-# Features
-ENABLE_SLACK = os.environ.get("ENABLE_SLACK", "true").lower() == "true"
+ENABLE_SLACK = os.environ.get("ENABLE_SLACK", "false").lower() == "true"
 ENABLE_DASHBOARD = os.environ.get("ENABLE_DASHBOARD", "true").lower() == "true"
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
+MEMORY_WARNING_PERCENT = 80.0
+QUEUE_WARNING_SIZE = 500
 
-# Thresholds
-MEMORY_WARNING_PERCENT = 80.0  # Warn if RSS > 80% of available
-QUEUE_WARNING_SIZE = 500  # Warn if queue backs up
-
-
-# ---------------------------------------------------------------------------
 # Logging setup
-# ---------------------------------------------------------------------------
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler("logs/detector.log"),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger("detector")
 
-def setup_logging():
-    """Configure logging to file and stdout."""
-    logger = logging.getLogger("detector")
-    logger.setLevel(getattr(logging, LOG_LEVEL))
-
-    # File handler
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setLevel(logging.DEBUG)
-
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-
-    # Formatter
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    return logger
-
-
-logger = setup_logging()
-
-
-# ---------------------------------------------------------------------------
-# Thread: LogTailer
-# ---------------------------------------------------------------------------
-
+# Thread: LogTailer (uses FileTailer.tail() iterator)
 class LogTailerThread(threading.Thread):
-    """Tail Nginx logs and emit raw lines."""
+    """Tail logs using FileTailer.tail() iterator."""
 
     def __init__(self, log_path: str, parse_queue: queue.Queue, shutdown_event: threading.Event):
         super().__init__(name="LogTailer", daemon=False)
         self.log_path = log_path
         self.parse_queue = parse_queue
         self.shutdown_event = shutdown_event
-        self.tailer = None
         self.lines_read = 0
         self.errors = 0
 
     def run(self):
-        """Main loop: tail logs and emit lines."""
+        """Main loop: use FileTailer.tail() iterator."""
         logger.info("LogTailer started | log_path=%s", self.log_path)
 
         try:
-            self.tailer = FileTailer(self.log_path, dead_letter_path=DEAD_LETTER_PATH)
-
-            while not self.shutdown_event.is_set():
+            tailer = FileTailer(self.log_path)
+            
+            # tail() returns a generator that yields lines
+            for line in tailer.tail():
+                if self.shutdown_event.is_set():
+                    break
+                
                 try:
-                    line = self.tailer.readline(timeout=1.0)
+                    self.lines_read += 1
+                    self.parse_queue.put(line, timeout=5.0)
 
-                    if line:
-                        self.lines_read += 1
-                        self.parse_queue.put(line, timeout=5.0)
+                    if self.lines_read % 1000 == 0:
+                        logger.debug("LogTailer | lines_read=%d", self.lines_read)
 
-                        if self.lines_read % 1000 == 0:
-                            logger.debug("LogTailer | lines_read=%d", self.lines_read)
-
-                    # Check queue backpressure
                     if self.parse_queue.qsize() > QUEUE_WARNING_SIZE:
-                        logger.warning(
-                            "LogTailer | parse_queue backing up | size=%d",
-                            self.parse_queue.qsize(),
-                        )
+                        logger.warning("LogTailer | parse_queue backing up | size=%d", self.parse_queue.qsize())
 
                 except queue.Full:
                     logger.error("LogTailer | parse_queue full, dropping line")
@@ -165,21 +91,11 @@ class LogTailerThread(threading.Thread):
             logger.error("LogTailer crashed: %s\n%s", exc, traceback.format_exc())
             self.errors += 1
         finally:
-            if self.tailer:
-                self.tailer.close()
-            logger.info(
-                "LogTailer stopped | lines_read=%d errors=%d",
-                self.lines_read,
-                self.errors,
-            )
+            logger.info("LogTailer stopped | lines_read=%d errors=%d", self.lines_read, self.errors)
 
-
-# ---------------------------------------------------------------------------
 # Thread: Parser
-# ---------------------------------------------------------------------------
-
 class ParserThread(threading.Thread):
-    """Parse JSON log entries and validate."""
+    """Parse JSON log entries."""
 
     def __init__(self, parse_queue: queue.Queue, detect_queue: queue.Queue, shutdown_event: threading.Event):
         super().__init__(name="Parser", daemon=False)
@@ -190,14 +106,13 @@ class ParserThread(threading.Thread):
         self.entries_failed = 0
 
     def run(self):
-        """Main loop: parse lines and emit LogEntry."""
+        """Main loop: parse lines."""
         logger.info("Parser started")
 
         try:
             while not self.shutdown_event.is_set():
                 try:
                     line = self.parse_queue.get(timeout=1.0)
-
                     result = parse_line(line)
 
                     if result.success:
@@ -205,45 +120,23 @@ class ParserThread(threading.Thread):
                         self.detect_queue.put(result.entry, timeout=5.0)
                     else:
                         self.entries_failed += 1
-                        # Dead letter file already handled by parse_line
 
                 except queue.Empty:
                     pass
                 except queue.Full:
-                    logger.error("Parser | detect_queue full, dropping entry")
+                    logger.error("Parser | detect_queue full")
                     self.entries_failed += 1
 
-        except KeyboardInterrupt:
-            logger.info("Parser interrupted")
         except Exception as exc:
-            logger.error("Parser crashed: %s\n%s", exc, traceback.format_exc())
-            self.entries_failed += 1
+            logger.error("Parser crashed: %s", exc)
         finally:
-            logger.info(
-                "Parser stopped | entries_parsed=%d failures=%d",
-                self.entries_parsed,
-                self.entries_failed,
-            )
+            logger.info("Parser stopped | parsed=%d failures=%d", self.entries_parsed, self.entries_failed)
 
-
-# ---------------------------------------------------------------------------
-# Thread: Detector (main detection logic)
-# ---------------------------------------------------------------------------
-
+# Thread: Detector
 class DetectorThread(threading.Thread):
-    """Main anomaly detection loop."""
+    """Main anomaly detection."""
 
-    def __init__(
-        self,
-        detect_queue: queue.Queue,
-        shutdown_event: threading.Event,
-        window: SlidingWindow,
-        baseline: BaselineEngine,
-        detector: AnomalyDetector,
-        blocker: BlocklistManager,
-        unbanner: UnbannerManager,
-        slack=None,
-    ):
+    def __init__(self, detect_queue, shutdown_event, window, baseline, detector, blocker, unbanner, slack=None):
         super().__init__(name="Detector", daemon=False)
         self.detect_queue = detect_queue
         self.shutdown_event = shutdown_event
@@ -259,7 +152,7 @@ class DetectorThread(threading.Thread):
         self.errors = 0
 
     def run(self):
-        """Main loop: detect anomalies, block IPs, escalate violations."""
+        """Main loop: detect anomalies."""
         logger.info("Detector started")
 
         try:
@@ -268,96 +161,44 @@ class DetectorThread(threading.Thread):
                     entry = self.detect_queue.get(timeout=1.0)
                     now = time.time()
 
-                    # Record in sliding window
                     self.window.record(entry.source_ip, entry.timestamp)
-
-                    # Get current rates
                     current_rate = self.window.ip_rate(entry.source_ip, as_of=now)
                     global_rate = self.window.global_rate(as_of=now)
-
-                    # Count errors for this IP in sliding window
-                    # (simplified: just look at current request)
-                    error_count = 1 if entry.status >= 400 else 0
-                    total_count = 1
-
-                    # Get baseline stats
                     ip_stats = self.baseline.get_stats(entry.source_ip, now=now)
 
-                    # Evaluate anomaly
                     result = self.detector.evaluate(
                         source_ip=entry.source_ip,
                         current_rate=current_rate,
-                        error_count=error_count,
-                        total_count=total_count,
+                        error_count=1 if entry.status >= 400 else 0,
+                        total_count=1,
                         global_rate=global_rate,
                         now=now,
                     )
 
                     self.entries_evaluated += 1
 
-                    # Handle decision
                     if result.decision == Decision.BLOCK:
                         self.blocks_issued += 1
-
-                        # Block the IP
-                        self.blocker.block_ip(
-                            entry.source_ip,
-                            reason=result.dominant_signal().name,
-                            action=BlockAction.DROP,
-                            score=result.max_score,
-                            ttl_seconds=600,  # 10 minutes default
-                        )
-
-                        # Record violation for escalation
-                        self.unbanner.record_violation(
-                            entry.source_ip,
-                            reason=result.dominant_signal().name,
-                            score=result.max_score,
-                        )
-
-                        # Mark as flagged (for tightening)
+                        self.blocker.block_ip(entry.source_ip, reason=result.dominant_signal().name, action=BlockAction.DROP, score=result.max_score, ttl_seconds=600)
+                        self.unbanner.record_violation(entry.source_ip, reason=result.dominant_signal().name, score=result.max_score)
                         self.detector.record_flag(entry.source_ip, now=now)
 
-                        # Send Slack alert
                         if self.slack:
-                            self.slack.send_alert(
-                                source_ip=entry.source_ip,
-                                decision="block",
-                                anomaly_score=result.max_score,
-                                dominant_signal=result.dominant_signal().name,
-                                current_rate=current_rate,
-                                baseline_mean=ip_stats.mean,
-                                baseline_stddev=ip_stats.stddev,
-                                z_score=result.dominant_signal().z_score,
-                                reasons=result.reasons,
-                                ban_duration_seconds=600,
-                            )
+                            try:
+                                self.slack.send_alert(source_ip=entry.source_ip, decision="block", anomaly_score=result.max_score, dominant_signal=result.dominant_signal().name, current_rate=current_rate, baseline_mean=ip_stats.mean, baseline_stddev=ip_stats.stddev, reasons=result.reasons, ban_duration_seconds=600)
+                            except Exception as e:
+                                logger.error("Slack alert failed: %s", e)
 
                     elif result.decision == Decision.FLAG:
                         self.flags_issued += 1
-
-                        # Send Slack alert
                         if self.slack:
-                            self.slack.send_alert(
-                                source_ip=entry.source_ip,
-                                decision="flag",
-                                anomaly_score=result.max_score,
-                                dominant_signal=result.dominant_signal().name,
-                                current_rate=current_rate,
-                                baseline_mean=ip_stats.mean,
-                                baseline_stddev=ip_stats.stddev,
-                                z_score=result.dominant_signal().z_score,
-                                reasons=result.reasons,
-                            )
+                            try:
+                                self.slack.send_alert(source_ip=entry.source_ip, decision="flag", anomaly_score=result.max_score, dominant_signal=result.dominant_signal().name, current_rate=current_rate, baseline_mean=ip_stats.mean, baseline_stddev=ip_stats.stddev, reasons=result.reasons)
+                            except Exception as e:
+                                logger.error("Slack alert failed: %s", e)
 
-                    # Log metrics every 100 entries
                     if self.entries_evaluated % 100 == 0:
-                        logger.debug(
-                            "Detector | evaluated=%d blocks=%d flags=%d",
-                            self.entries_evaluated,
-                            self.blocks_issued,
-                            self.flags_issued,
-                        )
+                        logger.debug("Detector | evaluated=%d blocks=%d flags=%d", self.entries_evaluated, self.blocks_issued, self.flags_issued)
 
                 except queue.Empty:
                     pass
@@ -365,36 +206,16 @@ class DetectorThread(threading.Thread):
                     logger.error("Detector error: %s", exc)
                     self.errors += 1
 
-        except KeyboardInterrupt:
-            logger.info("Detector interrupted")
         except Exception as exc:
-            logger.error("Detector crashed: %s\n%s", exc, traceback.format_exc())
+            logger.error("Detector crashed: %s", exc)
         finally:
-            logger.info(
-                "Detector stopped | evaluated=%d blocks=%d flags=%d errors=%d",
-                self.entries_evaluated,
-                self.blocks_issued,
-                self.flags_issued,
-                self.errors,
-            )
+            logger.info("Detector stopped | evaluated=%d blocks=%d flags=%d", self.entries_evaluated, self.blocks_issued, self.flags_issued)
 
-
-# ---------------------------------------------------------------------------
 # Thread: BackgroundTasks
-# ---------------------------------------------------------------------------
-
 class BackgroundTasksThread(threading.Thread):
-    """Periodic background maintenance: baseline recalc, unban processing, health check."""
+    """Periodic maintenance."""
 
-    def __init__(
-        self,
-        shutdown_event: threading.Event,
-        baseline: BaselineEngine,
-        unbanner: UnbannerManager,
-        blocker: BlocklistManager,
-        window: SlidingWindow,
-        slack=None,
-    ):
+    def __init__(self, shutdown_event, baseline, unbanner, blocker, window, slack=None):
         super().__init__(name="BackgroundTasks", daemon=True)
         self.shutdown_event = shutdown_event
         self.baseline = baseline
@@ -406,13 +227,12 @@ class BackgroundTasksThread(threading.Thread):
         self.iterations = 0
 
     def run(self):
-        """Main loop: periodic maintenance every 60 seconds."""
+        """Main loop: every 60 seconds."""
         logger.info("BackgroundTasks started")
 
         try:
             while not self.shutdown_event.is_set():
-                self.shutdown_event.wait(60.0)  # Wait 60 seconds
-
+                self.shutdown_event.wait(60.0)
                 if self.shutdown_event.is_set():
                     break
 
@@ -420,120 +240,58 @@ class BackgroundTasksThread(threading.Thread):
                     now = time.time()
                     self.iterations += 1
 
-                    # Recalculate baseline
                     self.baseline.recalculate(now=now)
-
-                    # Process scheduled unbans
                     unbanned = self.unbanner.process_scheduled_unbans(now=now)
-                    if unbanned > 0:
-                        logger.info("BackgroundTasks | auto-unbanned %d IPs", unbanned)
-                        # Send unban alerts to Slack
-                        if self.slack:
-                            for ip in self.unbanner.list_active_bans():
-                                if ip.ban_status.value == "unbanned":
-                                    self.slack.send_unban_alert(
-                                        source_ip=ip.source_ip,
-                                        ban_duration_seconds=int(ip.time_until_unban or 0),
-                                        violation_count=ip.violation_count,
-                                    )
-
-                    # Cleanup expired blocks
                     expired = self.blocker.cleanup_expired(now=now)
 
-                    # Health check
-                    self._health_check(now)
+                    cpu_percent = psutil.cpu_percent(interval=0.1)
+                    memory = psutil.virtual_memory()
 
-                    # Write metrics for dashboard
+                    if memory.percent > MEMORY_WARNING_PERCENT:
+                        logger.warning("HealthCheck | HIGH MEMORY: %.1f%%", memory.percent)
+
+                    if self.iterations % 60 == 0:
+                        uptime_hours = (now - self.start_time) / 3600
+                        logger.info("HealthCheck | uptime=%.1fh cpu=%.1f%% memory=%.1f%%", uptime_hours, cpu_percent, memory.percent)
+
                     global_rate = self.window.global_rate(as_of=now)
                     snapshot = self.window.ip_snapshot(as_of=now)
-                    top_ips = sorted(
-                        [{"ip": ip, "rate": rate} for ip, rate in snapshot.items()],
-                        key=lambda x: x["rate"],
-                        reverse=True,
-                    )[:10]
+                    top_ips = sorted([{"ip": ip, "rate": rate} for ip, rate in snapshot.items()], key=lambda x: x["rate"], reverse=True)[:10]
                     global_stats = self.baseline.get_stats("__global__", now=now)
 
-                    MetricsWriter.write_metrics(
-                        global_rate=global_rate,
-                        top_ips=top_ips,
-                        baseline_mean=global_stats.mean,
-                        baseline_stddev=global_stats.stddev,
-                        now=now,
-                    )
+                    try:
+                        MetricsWriter.write_metrics(global_rate=global_rate, top_ips=top_ips, baseline_mean=global_stats.mean, baseline_stddev=global_stats.stddev, now=now)
+                    except Exception as e:
+                        logger.error("Failed to write metrics: %s", e)
 
-                    logger.info(
-                        "BackgroundTasks | iteration=%d baseline_recalc unbanned=%d expired=%d",
-                        self.iterations,
-                        unbanned,
-                        expired,
-                    )
+                    logger.info("BackgroundTasks | iteration=%d unbanned=%d expired=%d", self.iterations, unbanned, expired)
 
                 except Exception as exc:
                     logger.error("BackgroundTasks error: %s", exc)
 
-        except KeyboardInterrupt:
-            logger.info("BackgroundTasks interrupted")
         finally:
             logger.info("BackgroundTasks stopped | iterations=%d", self.iterations)
 
-    def _health_check(self, now: float):
-        """Check system health and log warnings."""
-        try:
-            # CPU and memory
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            memory = psutil.virtual_memory()
-
-            if memory.percent > MEMORY_WARNING_PERCENT:
-                logger.warning(
-                    "HealthCheck | HIGH MEMORY: %.1f%% | available=%s",
-                    memory.percent,
-                    memory.available / (1024 ** 3),
-                )
-
-            # Uptime
-            uptime = now - self.start_time
-            if self.iterations % 60 == 0:  # Every hour
-                logger.info(
-                    "HealthCheck | uptime=%.0fh cpu=%.1f%% memory=%.1f%%",
-                    uptime / 3600,
-                    cpu_percent,
-                    memory.percent,
-                )
-
-        except Exception as exc:
-            logger.error("HealthCheck failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Dashboard thread
-# ---------------------------------------------------------------------------
-
+# Thread: Dashboard
 class DashboardThread(threading.Thread):
-    """Flask HTTP server for dashboard (read-only, no locks)."""
+    """Flask HTTP server."""
 
-    def __init__(self, shutdown_event: threading.Event, port: int):
+    def __init__(self, shutdown_event, port):
         super().__init__(name="Dashboard", daemon=True)
         self.shutdown_event = shutdown_event
         self.port = port
 
     def run(self):
-        """Start Flask server."""
+        """Start Flask."""
         logger.info("Dashboard starting on port %d", self.port)
-
         try:
             run_dashboard(host="0.0.0.0", port=self.port, debug=False)
-        except KeyboardInterrupt:
-            logger.info("Dashboard interrupted")
         except Exception as exc:
-            logger.error("Dashboard crashed: %s", exc)
+            logger.error("Dashboard error: %s", exc)
         finally:
             logger.info("Dashboard stopped")
 
-
-# ---------------------------------------------------------------------------
 # Main daemon
-# ---------------------------------------------------------------------------
-
 class AnomalyDetectorDaemon:
     """Multi-threaded anomaly detection daemon."""
 
@@ -542,13 +300,12 @@ class AnomalyDetectorDaemon:
         self.threads = []
 
     def start(self):
-        """Start the detector daemon."""
+        """Start the daemon."""
         logger.info("=" * 80)
         logger.info("HNG ANOMALY DETECTION DAEMON STARTING")
         logger.info("=" * 80)
 
         try:
-            # Initialize components
             logger.info("Initializing components...")
             window = SlidingWindow(window_seconds=60)
             baseline = BaselineEngine(window)
@@ -559,49 +316,31 @@ class AnomalyDetectorDaemon:
 
             logger.info("Components initialized")
 
-            # Create queues
             parse_queue = queue.Queue(maxsize=PARSE_QUEUE_SIZE)
             detect_queue = queue.Queue(maxsize=DETECT_QUEUE_SIZE)
 
-            # Create and start threads
             logger.info("Starting threads...")
 
-            tailer_thread = LogTailerThread(NGINX_LOG_PATH, parse_queue, self.shutdown_event)
-            self.threads.append(tailer_thread)
-            tailer_thread.start()
+            tailer = LogTailerThread(NGINX_LOG_PATH, parse_queue, self.shutdown_event)
+            self.threads.append(tailer)
+            tailer.start()
 
-            parser_thread = ParserThread(parse_queue, detect_queue, self.shutdown_event)
-            self.threads.append(parser_thread)
-            parser_thread.start()
+            parser = ParserThread(parse_queue, detect_queue, self.shutdown_event)
+            self.threads.append(parser)
+            parser.start()
 
-            detector_thread = DetectorThread(
-                detect_queue,
-                self.shutdown_event,
-                window,
-                baseline,
-                detector,
-                blocker,
-                unbanner,
-                slack,
-            )
-            self.threads.append(detector_thread)
-            detector_thread.start()
+            detector_th = DetectorThread(detect_queue, self.shutdown_event, window, baseline, detector, blocker, unbanner, slack)
+            self.threads.append(detector_th)
+            detector_th.start()
 
-            background_thread = BackgroundTasksThread(
-                self.shutdown_event,
-                baseline,
-                unbanner,
-                blocker,
-                window,
-                slack,
-            )
-            self.threads.append(background_thread)
-            background_thread.start()
+            background = BackgroundTasksThread(self.shutdown_event, baseline, unbanner, blocker, window, slack)
+            self.threads.append(background)
+            background.start()
 
             if ENABLE_DASHBOARD:
-                dashboard_thread = DashboardThread(self.shutdown_event, DASHBOARD_PORT)
-                self.threads.append(dashboard_thread)
-                dashboard_thread.start()
+                dashboard = DashboardThread(self.shutdown_event, DASHBOARD_PORT)
+                self.threads.append(dashboard)
+                dashboard.start()
                 logger.info("Dashboard enabled on port %d", DASHBOARD_PORT)
 
             logger.info("All threads started")
@@ -609,7 +348,6 @@ class AnomalyDetectorDaemon:
             logger.info("DAEMON RUNNING — Press Ctrl+C to stop")
             logger.info("=" * 80)
 
-            # Wait for threads
             for thread in self.threads:
                 thread.join()
 
@@ -619,27 +357,22 @@ class AnomalyDetectorDaemon:
 
     def shutdown(self):
         """Graceful shutdown."""
-        logger.info("Shutting down detector daemon...")
+        logger.info("Shutting down daemon...")
         self.shutdown_event.set()
 
-        # Wait for all threads to finish
-        timeout = 10.0  # seconds
+        timeout = 10.0
         start = time.time()
         for thread in self.threads:
             remaining = timeout - (time.time() - start)
             if remaining > 0:
                 thread.join(timeout=remaining)
-                if thread.is_alive():
-                    logger.warning("Thread %s did not stop gracefully", thread.name)
 
         logger.info("=" * 80)
         logger.info("DAEMON STOPPED")
         logger.info("=" * 80)
 
-
 def main():
     """Entry point."""
-    # Handle signals
     def signal_handler(sig, frame):
         daemon.shutdown()
         sys.exit(0)
@@ -649,7 +382,6 @@ def main():
 
     daemon = AnomalyDetectorDaemon()
     daemon.start()
-
 
 if __name__ == "__main__":
     main()

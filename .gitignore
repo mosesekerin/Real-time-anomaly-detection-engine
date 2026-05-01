@@ -12,3 +12,5 @@ __pycache__/
 systemd/*.env
 *.env
 logs/hng_metrics.json
+systemd/*.env
+hng-detector.env
