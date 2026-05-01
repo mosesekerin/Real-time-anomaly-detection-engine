@@ -1,0 +1,42 @@
+[Unit]
+Description=HNG Anomaly Detection Daemon
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hngdevops
+Group=hngdevops
+WorkingDirectory=/home/hngdevops/hng-stage3/hng-anomaly-detector
+
+# Set environment variables
+Environment="PYTHONUNBUFFERED=1"
+Environment="LOG_LEVEL=INFO"
+Environment="NGINX_LOG_PATH=logs/test-access.log"
+Environment="ENABLE_DASHBOARD=true"
+Environment="DASHBOARD_PORT=8080"
+
+# Start the detector
+ExecStart=/home/hngdevops/hng-stage3/hng-anomaly-detector/.venv/bin/python -m detector.main
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hng-detector
+
+# Resource limits (optional)
+MemoryLimit=512M
+CPUQuota=100%
+
+# Security (optional but recommended)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
