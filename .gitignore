@@ -6,3 +6,9 @@ __pycache__/
 *.dead.log
 *.log
 .env
+.env
+*.env
+.env.local
+systemd/*.env
+*.env
+logs/hng_metrics.json
